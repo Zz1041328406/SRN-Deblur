@@ -10,7 +10,9 @@ import tensorflow.contrib.slim as slim
 from datetime import datetime
 from util.util import *
 from util.BasicConvLSTMCell import *
-
+import math
+import cv2
+import collections
 
 class DEBLUR(object):
     def __init__(self, args):
@@ -21,17 +23,51 @@ class DEBLUR(object):
 
         # if args.phase == 'train':
         self.crop_size = 256
-        self.data_list = open(args.datalist, 'rt').read().splitlines()
-        self.data_list = list(map(lambda x: x.split(' '), self.data_list))
+
+        self.data_list = []
+
+        data_list1 = args.datalist.split(',')[0]
+        data_list1 = open(data_list1, 'rt').read().splitlines()
+        data_list1 = list(map(lambda x: x.strip().split(' '), data_list1))
+        self.data_list += data_list1
+        if self.args.over_sampling != 0:
+            datalist1_upsample = math.ceil(float(self.args.over_sampling) / float(len(data_list1)))
+            for i in range(int(datalist1_upsample) - 1):
+                self.data_list += data_list1
+
+        if len(args.datalist.split(',')) >= 2:
+            data_list2 = args.datalist.split(',')[1]
+            data_list2 = open(data_list2, 'rt').read().splitlines()
+            data_list2 = list(map(lambda x: x.strip().split(' '), data_list2))
+            self.data_list += data_list2
+
+            if self.args.over_sampling != 0:
+                datalist2_upsample = math.ceil(float(self.args.over_sampling) / float(len(data_list2)))
+                for i in range(int(datalist2_upsample) - 1):
+                    self.data_list += data_list2
+
+        if len(args.datalist.split(',')) >= 3:
+            data_list3 = args.datalist.split(',')[2]
+            data_list3 = open(data_list3, 'rt').read().splitlines()
+            data_list3 = list(map(lambda x: x.strip().split(' '), data_list3))
+            self.data_list += data_list3
+
+            if self.args.over_sampling != 0:
+                datalist3_upsample = math.ceil(float(self.args.over_sampling) / float(len(data_list3)))
+                for i in range(int(datalist3_upsample) - 1):
+                    self.data_list += data_list3
+
+
+        print('training sample number : ', len(self.data_list))
         random.shuffle(self.data_list)
-        self.train_dir = os.path.join('./checkpoints', args.model)
+
+        self.train_dir = os.path.join('./checkpoints', args.checkpoint_path)
         if not os.path.exists(self.train_dir):
             os.makedirs(self.train_dir)
 
         self.batch_size = args.batch_size
         self.epoch = args.epoch
-        self.data_size = (len(self.data_list)) // self.batch_size
-        self.max_steps = int(self.epoch * self.data_size)
+        self.max_steps = self.args.max_iteration #524000
         self.learning_rate = args.learning_rate
 
     def input_producer(self, batch_size=10):
@@ -45,7 +81,7 @@ class DEBLUR(object):
 
         def preprocessing(imgs):
             imgs = [tf.cast(img, tf.float32) / 255.0 for img in imgs]
-            if self.args.model is not 'color':
+            if self.args.model != 'color':
                 imgs = [tf.image.rgb_to_grayscale(img) for img in imgs]
             img_crop = tf.unstack(tf.random_crop(tf.stack(imgs, axis=0), [2, self.crop_size, self.crop_size, self.chns]),
                                   axis=0)
@@ -158,8 +194,8 @@ class DEBLUR(object):
         self.all_vars = all_vars
         self.g_vars = [var for var in all_vars if 'g_net' in var.name]
         self.lstm_vars = [var for var in all_vars if 'LSTM' in var.name]
-        for var in all_vars:
-            print(var.name)
+        #for var in all_vars:
+        #    print(var.name)
 
     def train(self):
         def get_optimizer(loss, global_step=None, var_list=None, is_gradient_clip=False):
@@ -183,8 +219,12 @@ class DEBLUR(object):
         self.build_model()
 
         # learning rate decay
-        self.lr = tf.train.polynomial_decay(self.learning_rate, global_step, self.max_steps, end_learning_rate=0.0,
-                                            power=0.3)
+        if self.args.warmup:
+            self.lr = polynomal_decay_warm_start(self.learning_rate, global_step, self.max_steps, 5000, 0.00001)
+        else:
+            self.lr = tf.train.polynomial_decay(self.learning_rate, global_step, self.max_steps, end_learning_rate=0.0, power=0.3)
+
+
         tf.summary.scalar('learning_rate', self.lr)
 
         # training operators
@@ -194,8 +234,15 @@ class DEBLUR(object):
         gpu_options = tf.GPUOptions(allow_growth=True)
         sess = tf.Session(config=tf.ConfigProto(gpu_options=gpu_options))
         self.sess = sess
-        sess.run(tf.global_variables_initializer())
-        self.saver = tf.train.Saver(max_to_keep=50, keep_checkpoint_every_n_hours=1)
+
+        if self.args.pre_trained == '':
+            self.saver = tf.train.Saver(max_to_keep=50, keep_checkpoint_every_n_hours=1)
+            sess.run(tf.global_variables_initializer())
+        elif self.args.pre_trained != '':
+            self.saver = tf.train.Saver(tf.trainable_variables(), max_to_keep=50, keep_checkpoint_every_n_hours=1)
+            sess.run(tf.global_variables_initializer())
+            self.load(sess, self.args.pre_trained, self.args.load_iteration)
+
         coord = tf.train.Coordinator()
         threads = tf.train.start_queue_runners(sess=sess, coord=coord)
 
@@ -223,13 +270,13 @@ class DEBLUR(object):
                 print(format_str % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), step, loss_total_val, 0.0,
                                     0.0, examples_per_sec, sec_per_batch))
 
-            if step % 20 == 0:
+            if step % 200 == 0:
                 # summary_str = sess.run(summary_op, feed_dict={inputs:batch_input, gt:batch_gt})
                 summary_str = sess.run(summary_op)
                 summary_writer.add_summary(summary_str, global_step=step)
 
             # Save the model checkpoint periodically.
-            if step % 1000 == 0 or step == self.max_steps:
+            if step % 30000 == 0 or step == self.max_steps:
                 checkpoint_path = os.path.join(self.train_dir, 'checkpoints')
                 self.save(sess, checkpoint_path, step)
 
@@ -259,10 +306,76 @@ class DEBLUR(object):
             print(" [*] Reading checkpoints... ERROR")
             return False
 
-    def test(self, height, width, input_path, output_path):
+    def test_one(self, height, width, input_path, output_path):
         if not os.path.exists(output_path):
             os.makedirs(output_path)
-        imgsName = sorted(os.listdir(input_path))
+        output_path = os.path.join(output_path, self.args.checkpoint_path)
+        if not os.path.exists(output_path):
+            os.makedirs(output_path)
+
+        H, W = height, width
+        inp_chns = 3 if self.args.model == 'color' else 1
+        self.batch_size = 1 if self.args.model == 'color' else 3
+
+
+
+        inputs = tf.placeholder(shape=[self.batch_size, H, W, inp_chns], dtype=tf.float32)
+        outputs = self.generator(inputs, reuse=False)
+
+        sess = tf.Session(config=tf.ConfigProto(gpu_options=tf.GPUOptions(allow_growth=True)))
+
+        self.saver = tf.train.Saver()
+        self.load(sess, self.train_dir, self.args.load_iteration)
+
+        inp_path = input_path
+        _inp_data = scipy.misc.imread(inp_path)  # (h, w, c)
+        inp_data = _inp_data.astype('float32') / 255
+
+        h = int(inp_data.shape[0])
+        w = int(inp_data.shape[1])
+
+        new_h = H
+        new_w = W
+        if (new_h - h) > 0 or (new_w - w) > 0:
+            inp_data = np.pad(inp_data, ((0, new_h - h), (0, new_w - w), (0, 0)), 'edge')
+
+        inp_data = np.expand_dims(inp_data, 0)
+        if self.args.model == 'color' or self.args.model == 'color-lstm':
+            val_x_unwrap = sess.run(outputs, feed_dict={inputs: inp_data})
+            out = val_x_unwrap[-1]
+        else:
+            inp_data = np.transpose(inp_data, (3, 1, 2, 0))  # (c, h, w, 1)
+            val_x_unwrap = sess.run(outputs, feed_dict={inputs: inp_data})
+            out = val_x_unwrap[-1]
+            out = np.transpose(out, (3, 1, 2, 0))  # (1, h, w, c)
+
+        if (new_h - h) > 0 or (new_w - w) > 0:
+            out = out[:, :h, :w, :]
+
+        out = np.clip(out*255, 0, 255) + 0.5
+        out = out.astype('uint8')
+        out = out[0]
+
+        out_img_name = inp_path.split('/')[-1]
+        out_img_name = out_img_name.split('.')[0]
+        out_img_name = out_img_name + ".png"
+
+        display_img = np.hstack([_inp_data, out])
+        dis_img_name = "vis_" + out_img_name + ".png"
+        #scipy.misc.imsave(os.path.join(output_path, dis_img_name), display_img)
+
+        if "kohler" not in self.args.datalist:
+            out_img_name = inp_path.split('/')[1] + "_" + out_img_name
+
+        scipy.misc.imsave(os.path.join(output_path, out_img_name), out)
+        #scipy.misc.imsave(os.path.join(output_path, out_img_name), _inp_data)
+
+    def test_bk(self, height, width, input_path, output_path):
+        if not os.path.exists(output_path):
+            os.makedirs(output_path)
+        output_path = os.path.join(output_path, self.args.checkpoint_path)
+        if not os.path.exists(output_path):
+            os.makedirs(output_path)
 
         H, W = height, width
         inp_chns = 3 if self.args.model == 'color' else 1
@@ -273,47 +386,195 @@ class DEBLUR(object):
         sess = tf.Session(config=tf.ConfigProto(gpu_options=tf.GPUOptions(allow_growth=True)))
 
         self.saver = tf.train.Saver()
-        self.load(sess, self.train_dir, step=523000)
+        self.load(sess, self.train_dir, self.args.load_iteration)
 
-        for imgName in imgsName:
-            blur = scipy.misc.imread(os.path.join(input_path, imgName))
-            h, w, c = blur.shape
-            # make sure the width is larger than the height
-            rot = False
-            if h > w:
-                blur = np.transpose(blur, [1, 0, 2])
-                rot = True
-            h = int(blur.shape[0])
-            w = int(blur.shape[1])
-            resize = False
-            if h > H or w > W:
-                scale = min(1.0 * H / h, 1.0 * W / w)
-                new_h = int(h * scale)
-                new_w = int(w * scale)
-                blur = scipy.misc.imresize(blur, [new_h, new_w], 'bicubic')
-                resize = True
-                blurPad = np.pad(blur, ((0, H - new_h), (0, W - new_w), (0, 0)), 'edge')
+        data_list = open(self.args.datalist, 'rt').read().splitlines()
+        data_list = list(map(lambda x: x.strip().split(' '), data_list))
+
+        total_psnr = 0
+        total_psnr_input = 0
+        total_mse = 0
+        val_print = 0
+        for gt_path, inp_path in data_list:
+            _inp_data = scipy.misc.imread(os.path.join('testing_set', inp_path))  # (h, w, c)
+            gt_data = scipy.misc.imread(os.path.join('testing_set', gt_path))  # (h, w, c)
+            inp_data = _inp_data.astype('float32') / 255
+
+            h = int(inp_data.shape[0])
+            w = int(inp_data.shape[1])
+
+            new_h = self.args.height
+            new_w = self.args.width
+
+            if (new_h - h) > 0 or (new_w - w) > 0:
+                inp_data = np.pad(inp_data, ((0, new_h - h), (0, new_w - w), (0, 0)), 'edge')
+
+            inp_data = np.expand_dims(inp_data, 0)
+            if self.args.model == 'color' or self.args.model == 'color-lstm':
+                val_x_unwrap = sess.run(outputs, feed_dict={inputs: inp_data})
+                out = val_x_unwrap[-1]
             else:
-                blurPad = np.pad(blur, ((0, H - h), (0, W - w), (0, 0)), 'edge')
-            blurPad = np.expand_dims(blurPad, 0)
-            if self.args.model is not 'color':
-                blurPad = np.transpose(blurPad, (3, 1, 2, 0))
+                inp_data = np.transpose(inp_data, (3, 1, 2, 0))  # (c, h, w, 1)
+                val_x_unwrap = sess.run(outputs, feed_dict={inputs: inp_data})
+                out = val_x_unwrap[-1]
+                out = np.transpose(out, (3, 1, 2, 0))  # (1, h, w, c)
 
-            start = time.time()
-            deblur = sess.run(outputs, feed_dict={inputs: blurPad / 255.0})
-            duration = time.time() - start
-            print('Saving results: %s ... %4.3fs' % (os.path.join(output_path, imgName), duration))
-            res = deblur[-1]
-            if self.args.model is not 'color':
-                res = np.transpose(res, (3, 1, 2, 0))
-            res = im2uint8(res[0, :, :, :])
-            # crop the image into original size
-            if resize:
-                res = res[:new_h, :new_w, :]
-                res = scipy.misc.imresize(res, [h, w], 'bicubic')
+            if (new_h - h) > 0 or (new_w - w) > 0:
+                out = out[:, :h, :w, :]
+
+
+            #out = np.clip(out, 0, 1) * 255
+            #out = out[0].astype('uint8')
+            #gt_data = gt_data.astype('uint8')
+            out = np.clip(out*255, 0, 255) + 0.5
+            out = out.astype('uint8')
+            out = out[0]
+
+            display_img = np.hstack([_inp_data, out, gt_data])
+
+
+            mse = np.mean((gt_data - out) ** 2)
+            val_psnr = cv2.PSNR(gt_data, out)
+            input_psnr = cv2.PSNR(gt_data, _inp_data)
+            print(mse, input_psnr, val_psnr, val_print)
+            val_print += 1
+            total_psnr += val_psnr
+            total_psnr_input += input_psnr
+            total_mse += mse
+
+            img_name = inp_path.replace('/','_')
+            img_name = img_name.split('.')[0]
+            dis_img_name = img_name + "_%.2f_%.2f" % (input_psnr, val_psnr) + ".jpg"
+            #scipy.misc.imsave(os.path.join(output_path, dis_img_name), display_img)
+
+            out_img_name = inp_path.split('/')[-1]
+            out_img_name = out_img_name.split('.')[0]
+            out_img_name = out_img_name + ".png"
+
+            if "kohler" not in self.args.datalist:
+                out_img_name = inp_path.split('/')[1] + "_" + out_img_name
+
+            scipy.misc.imsave(os.path.join(output_path, out_img_name), out)
+            #scipy.misc.imsave(os.path.join(output_path, out_img_name), _inp_data)
+
+        mean_psnr = total_psnr / len(self.data_list)
+        mean_psnr_input = total_psnr_input / len(self.data_list)
+        total_loss = total_mse / len(self.data_list)
+
+
+        format_str = ('%s: step %d, validation loss = (%.5f; %.5f, %.5f), psnr : (%.5f), psnr_input : (%.5f)')
+        print(format_str % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), self.args.load_iteration, total_loss, 0.0, 0.0, mean_psnr, mean_psnr_input))
+
+
+    def test(self, height, width, input_path, output_path):
+        if not os.path.exists(output_path):
+            os.makedirs(output_path)
+        output_path = os.path.join(output_path, self.args.checkpoint_path)
+        if not os.path.exists(output_path):
+            os.makedirs(output_path)
+
+        H, W = height, width
+        inp_chns = 3 if self.args.model == 'color' else 1
+        self.batch_size = 1 if self.args.model == 'color' else 3
+
+        network_dict = collections.defaultdict(list)
+
+        inputs = tf.placeholder(shape=[self.batch_size, H, W, inp_chns], dtype=tf.float32)
+        outputs = self.generator(inputs, reuse=False)
+
+        network_dict['%dx%d' % (H,W)] = [inputs, outputs]
+
+        sess = tf.Session(config=tf.ConfigProto(gpu_options=tf.GPUOptions(allow_growth=True)))
+
+        self.saver = tf.train.Saver()
+        self.load(sess, self.train_dir, self.args.load_iteration)
+
+        data_list = open(self.args.datalist, 'rt').read().splitlines()
+        data_list = list(map(lambda x: x.strip().split(' '), data_list))
+
+        total_psnr = 0
+        total_psnr_input = 0
+        total_mse = 0
+        val_print = 0
+        for gt_path, inp_path in data_list:
+            _inp_data = scipy.misc.imread(os.path.join('testing_set', inp_path))  # (h, w, c)
+            gt_data = scipy.misc.imread(os.path.join('testing_set', gt_path))  # (h, w, c)
+            inp_data = _inp_data.astype('float32') / 255
+
+            h = int(inp_data.shape[0])
+            w = int(inp_data.shape[1])
+
+            if (h % 16) == 0:
+                new_h = h
             else:
-                res = res[:h, :w, :]
+                new_h = h - (h % 16) + 16
+            if (w % 16) == 0:
+                new_w = w
+            else:
+                new_w = w - (w % 16) + 16
 
-            if rot:
-                res = np.transpose(res, [1, 0, 2])
-            scipy.misc.imsave(os.path.join(output_path, imgName), res)
+            if network_dict['%dx%d' % (new_h,new_w)] == []:
+                print('add network to dict', new_h, new_w)
+                inputs = tf.placeholder(shape=[self.batch_size, new_h, new_w, inp_chns], dtype=tf.float32)
+                outputs = self.generator(inputs, reuse=True)
+
+                network_dict['%dx%d' % (new_h, new_w)] = [inputs, outputs]
+
+            if (new_h - h) > 0 or (new_w - w) > 0:
+                inp_data = np.pad(inp_data, ((0, new_h - h), (0, new_w - w), (0, 0)), 'edge')
+
+            inp_data = np.expand_dims(inp_data, 0)
+            if self.args.model == 'color':
+                val_x_unwrap = sess.run(network_dict['%dx%d' % (new_h, new_w)][1], feed_dict={network_dict['%dx%d' % (new_h, new_w)][0]: inp_data})
+                out = val_x_unwrap[-1]
+            else:
+                inp_data = np.transpose(inp_data, (3, 1, 2, 0))  # (c, h, w, 1)
+                val_x_unwrap = sess.run(network_dict['%dx%d' % (new_h, new_w)][1], feed_dict={network_dict['%dx%d' % (new_h, new_w)][0]: inp_data})
+                out = val_x_unwrap[-1]
+                out = np.transpose(out, (3, 1, 2, 0))  # (1, h, w, c)
+
+            if (new_h - h) > 0 or (new_w - w) > 0:
+                out = out[:, :h, :w, :]
+
+
+            #out = np.clip(out, 0, 1) * 255
+            #out = out[0].astype('uint8')
+            #gt_data = gt_data.astype('uint8')
+            out = np.clip(out*255, 0, 255) + 0.5
+            out = out.astype('uint8')
+            out = out[0]
+
+            display_img = np.hstack([_inp_data, out, gt_data])
+
+
+            mse = np.mean((gt_data - out) ** 2)
+            val_psnr = cv2.PSNR(gt_data, out)
+            input_psnr = cv2.PSNR(gt_data, _inp_data)
+            print(mse, input_psnr, val_psnr, val_print)
+            val_print += 1
+            total_psnr += val_psnr
+            total_psnr_input += input_psnr
+            total_mse += mse
+
+            img_name = inp_path.replace('/','_')
+            img_name = img_name.split('.')[0]
+            dis_img_name = img_name + "_%.2f_%.2f" % (input_psnr, val_psnr) + ".jpg"
+            #scipy.misc.imsave(os.path.join(output_path, dis_img_name), display_img)
+
+            out_img_name = inp_path.split('/')[-1]
+            out_img_name = out_img_name.split('.')[0]
+            out_img_name = out_img_name + ".png"
+
+            if "kohler" not in self.args.datalist:
+                out_img_name = inp_path.split('/')[1] + "_" + out_img_name
+
+            scipy.misc.imsave(os.path.join(output_path, out_img_name), out)
+            #scipy.misc.imsave(os.path.join(output_path, out_img_name), _inp_data)
+
+        mean_psnr = total_psnr / len(self.data_list)
+        mean_psnr_input = total_psnr_input / len(self.data_list)
+        total_loss = total_mse / len(self.data_list)
+
+
+        format_str = ('%s: step %d, validation loss = (%.5f; %.5f, %.5f), psnr : (%.5f), psnr_input : (%.5f)')
+        print(format_str % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), self.args.load_iteration, total_loss, 0.0, 0.0, mean_psnr, mean_psnr_input))

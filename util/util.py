@@ -20,3 +20,17 @@ def ResnetBlock(x, dim, ksize, scope='rb'):
         net = slim.conv2d(x, dim, [ksize, ksize], scope='conv1')
         net = slim.conv2d(net, dim, [ksize, ksize], activation_fn=None, scope='conv2')
         return net + x
+
+def polynomal_decay_warm_start(learning_rate, global_step, max_steps, warm_step=10000.0, init_value=0.00001):
+
+    global_step = tf.cast(global_step, tf.float32)
+
+    diff_lr = learning_rate - init_value
+    t = global_step / warm_step
+    t = tf.minimum(1.0, t)
+
+    lr = init_value + diff_lr * t
+    new_step = tf.maximum(global_step-warm_step, 0.0)
+    lr = tf.train.polynomial_decay(lr, new_step, max_steps-warm_step, end_learning_rate=0.0,
+                              power=0.3)
+    return lr

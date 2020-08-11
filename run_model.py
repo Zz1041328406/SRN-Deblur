@@ -4,7 +4,14 @@ import tensorflow as tf
 # import models.model_gray as model
 # import models.model_color as model
 import models.model as model
+import shutil
+import numpy as np
+import random
 
+
+tf.set_random_seed(0)
+np.random.seed(0)
+random.seed(0)
 
 def parse_args():
     parser = argparse.ArgumentParser(description='deblur arguments')
@@ -23,6 +30,16 @@ def parse_args():
                         help='input path for testing images')
     parser.add_argument('--output_path', type=str, default='./testing_res',
                         help='output path for testing images')
+
+    # new args
+    parser.add_argument('--max_iteration', type=int, default=262000)
+    parser.add_argument('--pre_trained', type=str, default='', help='pre_trained model path')
+    parser.add_argument('--partial_load', type=int, default=0)
+    parser.add_argument('--checkpoint_path', type=str, default='model', help='output path for testing images')
+    parser.add_argument('--load_iteration', type=int, default=262000)
+    parser.add_argument('--over_sampling', type=int, default=0)
+    parser.add_argument('--warmup', type=int, default=0)
+
     args = parser.parse_args()
     return args
 
